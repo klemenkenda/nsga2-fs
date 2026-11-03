@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsga2-fs"
+version = "0.1.0"
+description = "NSGA-II for feature selection, with the optional MIIP improvement phase of NSGAII-MIIP (Li et al., EJOR 2025), ported from MATLAB"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Klemen Kenda", email = "klemen.kenda@ijs.si" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+parallel = ["joblib"]
+test = ["pytest", "scikit-learn"]
+
+[project.urls]
+Repository = "https://github.com/klemenkenda/nsga2-fs"
+Upstream = "https://github.com/andali89/NSGAII-MIIP"
+
+[tool.setuptools]
+py-modules = ["nsgaii_miip"]

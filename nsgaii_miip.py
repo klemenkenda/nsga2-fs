@@ -606,3 +606,154 @@ def run_nsgaii_miip(n_features: int,
         "unique_subsets_cached": len(cache),
         "stopped_on": "stagnation" if stagnated else "budget",
     }
+
+
+# ------------------------------------------------------- plain NSGA-II driver
+INITIALIZATIONS = {"obl": obl_initialization, "sparse": sparse_initialization,
+                   "uniform": uniform_initialization,
+                   "loguniform": loguniform_initialization}
+
+
+def run_nsga2(n_features: int,
+              objective: Callable[[np.ndarray], float],
+              seed: int,
+              stop_evaluations: int,
+              pop_size: int = 100,
+              c_rate: float = 0.9,
+              m_rate: Optional[float] = None,
+              init: str = "obl",
+              mutation: str = "balanced",
+              rng_streams: bool = False,
+              max_barren_generations: Optional[int] = None,
+              stop_at_size: Optional[int] = None,
+              progress_cb: Optional[Callable[[int], None]] = None,
+              iteration_cb: Optional[Callable[[int, int], None]] = None,
+              scored_cb: Optional[Callable[[np.ndarray, float, float], None]] = None
+              ) -> Dict:
+    """Plain NSGA-II: the operators of `run_nsgaii_miip` without the MIIP
+    improvement phase, so no clustering or mutual information is needed.
+
+    The search is the one `sota_baselines.run_nsga2` in FASTENER's experiments
+    runs (the `nsga2`, `nsga2_sparse` and `p2_*` arms): the same random draws
+    in the same order, so the same seed gives the same front.
+
+    `objective` returns the score to MAXIMISE for one boolean gene vector; the
+    second objective is the number of selected features. `init` is one of
+    INITIALIZATIONS; `mutation` is "balanced" or "min1"; `rng_streams` draws
+    the start and the operators from separate streams, so runs that differ
+    only in their operators start from the same population. The run stops when
+    the fit budget is spent, after `max_barren_generations` generations in a
+    row that score no new subset, or after the generation in which a subset of
+    at most `stop_at_size` features was first scored; `stopped_on` says which.
+
+    `iteration_cb(iteration, evaluations)` is called after the initial
+    population (iteration 0) and after every generation;
+    `scored_cb(genes, score, seconds)` after every new fit.
+    """
+    import hashlib
+    import time
+
+    if init not in INITIALIZATIONS:
+        raise ValueError(f"unknown init {init!r}; have {sorted(INITIALIZATIONS)}")
+    if mutation not in ("balanced", "min1"):
+        raise ValueError(f"unknown mutation {mutation!r}")
+    if rng_streams:
+        start_ss, ops_ss = np.random.SeedSequence(seed).spawn(2)
+        init_rng = np.random.RandomState(np.random.MT19937(start_ss))
+        rng = np.random.RandomState(np.random.MT19937(ops_ss))
+    else:
+        rng = np.random.RandomState(seed)
+        init_rng = rng
+    m_rate = m_rate if m_rate is not None else 1.0 / n_features
+
+    evaluations = 0
+    cache: Dict[bytes, float] = {}
+    reached = False
+
+    def evaluate(P: np.ndarray):
+        """Score a population, as in `run_nsgaii_miip`: the fit budget is
+        exact, and cached subsets score without a fit."""
+        nonlocal evaluations, reached
+        objs = np.empty((P.shape[0], 2))
+        ok = np.ones(P.shape[0], dtype=bool)
+        for i, genes in enumerate(P):
+            size = int(genes.sum())
+            if size == 0:
+                objs[i] = (1.0, 0.0)
+                continue
+            key = np.packbits(genes).tobytes()
+            if key not in cache:
+                if evaluations >= stop_evaluations:
+                    ok[i] = False
+                    continue
+                t_fit = time.perf_counter()
+                cache[key] = objective(genes)
+                evaluations += 1
+                if stop_at_size is not None and size <= stop_at_size:
+                    reached = True
+                if scored_cb is not None:
+                    scored_cb(genes, cache[key], time.perf_counter() - t_fit)
+            objs[i] = (-cache[key], size)
+        return objs, ok
+
+    pop = INITIALIZATIONS[init](pop_size, n_features, init_rng)
+    start_hash = hashlib.sha256(np.packbits(pop).tobytes()).hexdigest()[:16]
+    objs, ok = evaluate(pop)
+    pop, objs = pop[ok], objs[ok]
+
+    iteration = 0
+    if iteration_cb is not None:
+        iteration_cb(0, evaluations)
+    barren = barren_counter(max_barren_generations)
+    barren(evaluations)
+    stagnated = False
+    while evaluations < stop_evaluations and not reached:
+        iteration += 1
+        if progress_cb is not None:
+            progress_cb(evaluations)
+        fronts = fast_nondominated_sort(objs)
+        rank = np.empty(pop.shape[0], dtype=int)
+        crowd = np.zeros(pop.shape[0])
+        for r, f in enumerate(fronts):
+            rank[f] = r
+            crowd[f] = crowding_distance(objs[f])
+
+        off = binary_tournament_crossover(pop, rank, crowd, c_rate, rng)
+        if mutation == "min1":
+            off, _ = balanced_mutation_min1(off, m_rate, rng)
+        else:
+            off = balanced_mutation(off, m_rate, rng)
+        off_objs, ok = evaluate(off)
+        off, off_objs = off[ok], off_objs[ok]
+
+        merged = np.vstack([pop, off])
+        merged_objs = np.vstack([objs, off_objs])
+
+        keep: List[int] = []
+        for f in fast_nondominated_sort(merged_objs):
+            if len(keep) + f.size <= pop_size:
+                keep.extend(f.tolist())
+            else:
+                d = crowding_distance(merged_objs[f])
+                keep.extend(f[np.argsort(-d)][: pop_size - len(keep)].tolist())
+                break
+        idx = np.array(keep, dtype=int)
+        pop, objs = merged[idx], merged_objs[idx]
+
+        if iteration_cb is not None:
+            iteration_cb(iteration, evaluations)
+        if barren(evaluations):
+            stagnated = True
+            break
+
+    final = fast_nondominated_sort(objs)[0]
+    return {
+        "pareto_genes": pop[final],
+        "pareto_objs": objs[final],
+        "evaluations": evaluations,
+        "iterations": iteration,
+        "unique_subsets_cached": len(cache),
+        "start_population_sha256": start_hash,
+        "stopped_on": ("reach" if reached else
+                       "stagnation" if stagnated else "budget"),
+    }
